@@ -222,6 +222,51 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeListDroppingSiblingOfVariantStillFa
                         "partial projection inside list");
 }
 
+TEST(NestedProjectionUtilsTest, PruneDataTypeListStructSchemaEvolutionAddedField) {
+    // Schema evolution: a field (id=12) was added inside the list's struct, so
+    // read is a superset of the file (nothing dropped). Should read the file's
+    // struct and return it; the added field is null-filled downstream.
+    auto data_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto read_inner = arrow::struct_({MakeField("a", arrow::int32(), 10),
+                                      MakeField("b", arrow::utf8(), 11),
+                                      MakeField("c", arrow::int32(), 12)});
+    auto data_type = arrow::list(arrow::field("item", data_inner));
+    auto read_type = arrow::list(arrow::field("item", read_inner));
+
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.value()->Equals(*data_type)) << result.value()->ToString();
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeMapStructSchemaEvolutionAddedField) {
+    // Added field inside a MAP value.
+    auto data_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto read_inner = arrow::struct_({MakeField("a", arrow::int32(), 10),
+                                      MakeField("b", arrow::utf8(), 11),
+                                      MakeField("c", arrow::int32(), 12)});
+    auto data_type = arrow::map(arrow::utf8(), data_inner);
+    auto read_type = arrow::map(arrow::utf8(), read_inner);
+
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.value()->Equals(*data_type)) << result.value()->ToString();
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeListStructDropAndAddStillFails) {
+    // Dropping a file field (b) is a real partial projection -- keep failing.
+    auto data_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto read_inner = arrow::struct_(
+        {MakeField("a", arrow::int32(), 10), MakeField("c", arrow::int32(), 12)});
+    auto data_type = arrow::list(arrow::field("item", data_inner));
+    auto read_type = arrow::list(arrow::field("item", read_inner));
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "partial projection inside list");
+}
+
 TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionNoProjection) {
     auto file_schema = arrow::schema({
         MakeField("f0", arrow::int32(), 1),

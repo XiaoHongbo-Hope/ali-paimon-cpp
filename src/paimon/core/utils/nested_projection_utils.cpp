@@ -181,6 +181,75 @@ bool IsVariantAccessSubstitution(const std::shared_ptr<arrow::DataType>& read_ty
     return true;
 }
 
+// Reconcile a LIST/MAP item type. Read may ADD fields (schema evolution;
+// null-filled downstream) but must not DROP a file field -- format readers
+// cannot partially project inside a repeated group. Returns the file-readable
+// item type. `container` is "list" or "map" for the error message.
+Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
+    const std::shared_ptr<arrow::DataType>& read_type,
+    const std::shared_ptr<arrow::DataType>& data_type, const char* container) {
+    if (read_type->Equals(data_type)) {
+        return data_type;
+    }
+    if (IsVariantAccessSubstitution(read_type, data_type)) {
+        return read_type;
+    }
+    if (read_type->id() != data_type->id()) {
+        return Status::Invalid(
+            fmt::format("PruneDataType nested item type mismatch inside {}: read {} vs data {}",
+                        container, read_type->ToString(), data_type->ToString()));
+    }
+    switch (data_type->id()) {
+        case arrow::Type::STRUCT: {
+            arrow::FieldVector item_fields;
+            for (const auto& data_child : data_type->fields()) {
+                PAIMON_ASSIGN_OR_RAISE(int32_t data_child_id,
+                                       NestedProjectionUtils::GetPaimonFieldId(data_child));
+                std::shared_ptr<arrow::Field> read_child;
+                for (const auto& candidate : read_type->fields()) {
+                    PAIMON_ASSIGN_OR_RAISE(int32_t candidate_id,
+                                           NestedProjectionUtils::GetPaimonFieldId(candidate));
+                    if (candidate_id == data_child_id) {
+                        read_child = candidate;
+                        break;
+                    }
+                }
+                if (!read_child) {
+                    // A file field is dropped -- a real partial projection.
+                    return Status::Invalid(fmt::format(
+                        "PruneDataType does not support partial projection inside {}: src {} vs "
+                        "target {}",
+                        container, data_type->ToString(), read_type->ToString()));
+                }
+                PAIMON_ASSIGN_OR_RAISE(
+                    std::shared_ptr<arrow::DataType> item_child_type,
+                    PruneRepeatedItemType(read_child->type(), data_child->type(), container));
+                item_fields.push_back(data_child->WithType(item_child_type));
+            }
+            return arrow::struct_(item_fields);
+        }
+        case arrow::Type::LIST: {
+            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::DataType> item,
+                                   PruneRepeatedItemType(read_type->field(0)->type(),
+                                                         data_type->field(0)->type(), container));
+            return arrow::list(data_type->field(0)->WithType(item));
+        }
+        case arrow::Type::MAP: {
+            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
+            auto data_map = std::static_pointer_cast<arrow::MapType>(data_type);
+            PAIMON_ASSIGN_OR_RAISE(
+                std::shared_ptr<arrow::DataType> key,
+                PruneRepeatedItemType(read_map->key_type(), data_map->key_type(), container));
+            PAIMON_ASSIGN_OR_RAISE(
+                std::shared_ptr<arrow::DataType> item,
+                PruneRepeatedItemType(read_map->item_type(), data_map->item_type(), container));
+            return arrow::map(key, item);
+        }
+        default:
+            return data_type;
+    }
+}
+
 }  // namespace
 
 Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::PruneDataType(
@@ -235,22 +304,26 @@ Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::P
             if (IsVariantAccessSubstitution(read_type, data_type)) {
                 return std::optional<std::shared_ptr<arrow::DataType>>(read_type);
             }
-            // Keep behavior aligned with format readers: partial projection inside
-            // LIST is unsupported and must fail fast.
-            return Status::Invalid(
-                fmt::format("PruneDataType does not support partial projection inside list: src {} "
-                            "vs target {}",
-                            data_type->ToString(), read_type->ToString()));
+            // Added fields (schema evolution) are allowed; dropped fields still fail.
+            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::DataType> item,
+                                   PruneRepeatedItemType(read_type->field(0)->type(),
+                                                         data_type->field(0)->type(), "list"));
+            return std::optional<std::shared_ptr<arrow::DataType>>(
+                arrow::list(data_type->field(0)->WithType(item)));
         }
         case arrow::Type::MAP: {
             if (IsVariantAccessSubstitution(read_type, data_type)) {
                 return std::optional<std::shared_ptr<arrow::DataType>>(read_type);
             }
-            // Keep behavior aligned with format readers: partial projection inside
-            // MAP is unsupported and must fail fast.
-            return Status::Invalid(fmt::format(
-                "PruneDataType does not support partial projection inside map: src {} vs target {}",
-                data_type->ToString(), read_type->ToString()));
+            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
+            auto data_map = std::static_pointer_cast<arrow::MapType>(data_type);
+            PAIMON_ASSIGN_OR_RAISE(
+                std::shared_ptr<arrow::DataType> key,
+                PruneRepeatedItemType(read_map->key_type(), data_map->key_type(), "map"));
+            PAIMON_ASSIGN_OR_RAISE(
+                std::shared_ptr<arrow::DataType> item,
+                PruneRepeatedItemType(read_map->item_type(), data_map->item_type(), "map"));
+            return std::optional<std::shared_ptr<arrow::DataType>>(arrow::map(key, item));
         }
         default:
             // Atomic type: return data_type as-is (type evolution is handled
