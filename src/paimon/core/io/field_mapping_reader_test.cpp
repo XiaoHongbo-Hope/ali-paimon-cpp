@@ -461,9 +461,9 @@ TEST_F(FieldMappingReaderTest, TestSchemaEvolutionAddedFieldInsideList) {
                                        id_field("b", arrow::utf8(), 11),
                                        id_field("c", arrow::int32(), 12)});
     std::vector<DataField> data_fields = {
-        DataField(100, arrow::field("data_contents", arrow::list(arrow::field("item", data_struct))))};
+        DataField(100, arrow::field("items", arrow::list(arrow::field("item", data_struct))))};
     std::vector<DataField> read_fields = {
-        DataField(100, arrow::field("data_contents", arrow::list(arrow::field("item", read_struct))))};
+        DataField(100, arrow::field("items", arrow::list(arrow::field("item", read_struct))))};
     auto data_schema = DataField::ConvertDataFieldsToArrowSchema(data_fields);
     auto read_schema = DataField::ConvertDataFieldsToArrowSchema(read_fields);
 

@@ -16,6 +16,7 @@
 
 #include "paimon/core/utils/nested_projection_utils.h"
 
+#include "arrow/array/array_dict.h"
 #include "arrow/array/array_nested.h"
 #include "arrow/array/builder_binary.h"
 #include "arrow/array/builder_dict.h"
@@ -306,6 +307,36 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeNullFillsAddedListStructFiel
     auto a_col = std::static_pointer_cast<arrow::Int32Array>(out_struct->GetFieldByName("a"));
     ASSERT_EQ(a_col->Value(0), 1);
     ASSERT_EQ(a_col->Value(2), 3);
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsDictionaryLeafAndNullFills) {
+    // ORC lazy decoding returns nested strings as dictionary; a dict-encoded `a`
+    // must be kept (not rejected) while the added `b` is null-filled.
+    auto* pool = arrow::default_memory_pool();
+    arrow::StringBuilder vb(pool);
+    ASSERT_TRUE(vb.AppendValues({"x", "y"}).ok());
+    std::shared_ptr<arrow::Array> dict_values;
+    ASSERT_TRUE(vb.Finish(&dict_values).ok());
+    arrow::Int32Builder ib(pool);
+    ASSERT_TRUE(ib.AppendValues({0, 1, 0}).ok());
+    std::shared_ptr<arrow::Array> dict_indices;
+    ASSERT_TRUE(ib.Finish(&dict_indices).ok());
+    auto dict_type = arrow::dictionary(arrow::int32(), arrow::utf8());
+    auto a_dict =
+        arrow::DictionaryArray::FromArrays(dict_type, dict_indices, dict_values).ValueOrDie();
+    auto data_struct = arrow::struct_({MakeField("a", dict_type, 10)});
+    auto struct_arr = arrow::StructArray::Make({a_dict}, data_struct->fields()).ValueOrDie();
+
+    auto read_type =
+        arrow::struct_({MakeField("a", arrow::utf8(), 10), MakeField("b", arrow::int32(), 11)});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    auto out = std::static_pointer_cast<arrow::StructArray>(aligned);
+    ASSERT_EQ(out->num_fields(), 2);
+    ASSERT_EQ(out->field(0)->type_id(), arrow::Type::DICTIONARY);  // `a` kept dict-encoded
+    auto b = out->GetFieldByName("b");
+    ASSERT_NE(b, nullptr);
+    ASSERT_EQ(b->null_count(), b->length());  // added `b` all null
 }
 
 TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionNoProjection) {
