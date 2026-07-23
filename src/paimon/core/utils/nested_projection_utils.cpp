@@ -243,7 +243,9 @@ Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
             PAIMON_ASSIGN_OR_RAISE(
                 std::shared_ptr<arrow::DataType> item,
                 PruneRepeatedItemType(read_map->item_type(), data_map->item_type(), container));
-            return arrow::map(key, item);
+            return std::static_pointer_cast<arrow::DataType>(std::make_shared<arrow::MapType>(
+                data_map->key_field()->WithType(key), data_map->item_field()->WithType(item),
+                data_map->keys_sorted()));
         }
         default:
             return data_type;
@@ -323,7 +325,9 @@ Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::P
             PAIMON_ASSIGN_OR_RAISE(
                 std::shared_ptr<arrow::DataType> item,
                 PruneRepeatedItemType(read_map->item_type(), data_map->item_type(), "map"));
-            return std::optional<std::shared_ptr<arrow::DataType>>(arrow::map(key, item));
+            return std::optional<std::shared_ptr<arrow::DataType>>(std::make_shared<arrow::MapType>(
+                data_map->key_field()->WithType(key), data_map->item_field()->WithType(item),
+                data_map->keys_sorted()));
         }
         default:
             // Atomic type: return data_type as-is (type evolution is handled
@@ -531,6 +535,12 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
     if (array->type()->Equals(*read_type)) {
         return array;
     }
+    // Only same-kind structural differences (added nested fields) are handled; a
+    // differing kind or atomic type (nested type evolution) is not.
+    if (array->type()->id() != read_type->id()) {
+        return Status::Invalid(fmt::format("AlignArrayToReadType cannot reconcile {} to {}",
+                                           array->type()->ToString(), read_type->ToString()));
+    }
     const auto& data = array->data();
     switch (read_type->id()) {
         case arrow::Type::STRUCT: {
@@ -591,7 +601,8 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
             return arrow::MakeArray(new_data);
         }
         default:
-            return array;
+            return Status::Invalid(fmt::format("AlignArrayToReadType cannot reconcile {} to {}",
+                                               array->type()->ToString(), read_type->ToString()));
     }
 }
 

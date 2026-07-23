@@ -35,7 +35,6 @@
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/core/casting/cast_executor.h"
 #include "paimon/core/casting/casting_utils.h"
-#include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/core/utils/field_mapping.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/memory/bytes.h"
@@ -229,11 +228,16 @@ Result<std::shared_ptr<arrow::Array>> FieldMappingReader::CastNonPartitionArrayI
             // dictionary, need reconstruct struct type
             column = struct_array->field(i);
         }
-        // Null-fill nested fields added by schema evolution (no-op otherwise).
-        PAIMON_ASSIGN_OR_RAISE(
-            column, NestedProjectionUtils::AlignArrayToReadType(
-                        column, non_partition_info_.non_partition_read_schema[i].Type(),
-                        arrow_pool_.get()));
+        // Null-fill nested fields added by schema evolution. Only when the data and
+        // read types differ -- the reader may hand back a dictionary-encoded array
+        // for an unchanged type, which is not a reshape target.
+        if (!non_partition_info_.non_partition_data_schema[i].Type()->Equals(
+                *non_partition_info_.non_partition_read_schema[i].Type())) {
+            PAIMON_ASSIGN_OR_RAISE(
+                column, NestedProjectionUtils::AlignArrayToReadType(
+                            column, non_partition_info_.non_partition_read_schema[i].Type(),
+                            arrow_pool_.get()));
+        }
         casted_array.push_back(column);
         casted_field_names.push_back(non_partition_info_.non_partition_data_schema[i].Name());
     }
