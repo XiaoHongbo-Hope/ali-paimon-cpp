@@ -2549,10 +2549,9 @@ TEST_P(WriteAndReadInteTest, TestMapSharedShreddingStructValueSchemaEvolutionRea
     fields_with_changed_tag_value[1] =
         DataField(fields_v0[1].Id(), tag_field->WithType(changed_tag_value_type));
     ASSERT_OK(WriteNextSchema(fields_with_changed_tag_value, schema_v0->HighestFieldId(), options));
-    ASSERT_NOK_WITH_MSG(read_fields({"tags"}),
-                        "PruneDataType does not support partial projection inside map: src "
-                        "map<string, struct<v: int64, label: string>> vs target "
-                        "map<string, struct<v: string, label: string>>");
+    ASSERT_NOK_WITH_MSG(
+        read_fields({"tags"}),
+        "PruneDataType nested item type mismatch inside map: read string vs data int64");
 
     auto profile_field = fields_v0[2].ArrowField();
     auto profile_struct =
