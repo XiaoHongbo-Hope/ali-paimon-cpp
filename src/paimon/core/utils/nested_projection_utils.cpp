@@ -606,14 +606,21 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
             out_fields.reserve(read_type->num_fields());
             children.reserve(read_type->num_fields());
             for (const auto& read_field : read_type->fields()) {
-                PAIMON_ASSIGN_OR_RAISE(int32_t read_id, GetPaimonFieldId(read_field));
+                // Match by name (parquet drops nested field-id metadata); if both
+                // carry IDs they must agree, so a drop+add same-name field won't match.
+                auto read_id = GetPaimonFieldId(read_field);
                 int32_t match = -1;
                 for (int32_t j = 0; j < array_type->num_fields(); j++) {
-                    PAIMON_ASSIGN_OR_RAISE(int32_t data_id, GetPaimonFieldId(array_type->field(j)));
-                    if (data_id == read_id) {
-                        match = j;
-                        break;
+                    const auto& array_field = array_type->field(j);
+                    if (array_field->name() != read_field->name()) {
+                        continue;
                     }
+                    auto data_id = GetPaimonFieldId(array_field);
+                    if (read_id.ok() && data_id.ok() && read_id.value() != data_id.value()) {
+                        continue;
+                    }
+                    match = j;
+                    break;
                 }
                 if (match >= 0) {
                     auto child = arrow::MakeArray(data->child_data[match]);
