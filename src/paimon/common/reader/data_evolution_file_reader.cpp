@@ -16,6 +16,8 @@
 
 #include "paimon/common/reader/data_evolution_file_reader.h"
 
+#include "arrow/array/array_nested.h"
+#include "arrow/array/util.h"
 #include "arrow/c/abi.h"
 #include "arrow/c/bridge.h"
 #include "fmt/format.h"
@@ -23,8 +25,91 @@
 #include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/core/utils/nested_projection_utils.h"
 
 namespace paimon {
+
+namespace {
+
+// Reshape an exist-field array (read as the file's structure) to `read_type`,
+// null-filling nested fields added by schema evolution. No-op when the types
+// already match. Structs match children by paimon field id; list/map recurse
+// into their items positionally, preserving offsets and validity.
+Result<std::shared_ptr<arrow::Array>> AlignArrayToReadType(
+    const std::shared_ptr<arrow::Array>& array,
+    const std::shared_ptr<arrow::DataType>& read_type, arrow::MemoryPool* pool) {
+    if (array->type()->Equals(*read_type)) {
+        return array;
+    }
+    const auto& data = array->data();
+    switch (read_type->id()) {
+        case arrow::Type::STRUCT: {
+            const auto& array_type = array->type();
+            std::vector<std::shared_ptr<arrow::ArrayData>> children;
+            children.reserve(read_type->num_fields());
+            for (const auto& read_field : read_type->fields()) {
+                PAIMON_ASSIGN_OR_RAISE(int32_t read_id,
+                                       NestedProjectionUtils::GetPaimonFieldId(read_field));
+                int32_t match = -1;
+                for (int32_t j = 0; j < array_type->num_fields(); j++) {
+                    PAIMON_ASSIGN_OR_RAISE(
+                        int32_t data_id,
+                        NestedProjectionUtils::GetPaimonFieldId(array_type->field(j)));
+                    if (data_id == read_id) {
+                        match = j;
+                        break;
+                    }
+                }
+                if (match >= 0) {
+                    auto child = arrow::MakeArray(data->child_data[match]);
+                    PAIMON_ASSIGN_OR_RAISE(child,
+                                           AlignArrayToReadType(child, read_field->type(), pool));
+                    children.push_back(child->data());
+                } else {
+                    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                        std::shared_ptr<arrow::Array> null_child,
+                        arrow::MakeArrayOfNull(read_field->type(), data->offset + data->length,
+                                               pool));
+                    children.push_back(null_child->data());
+                }
+            }
+            auto new_data = data->Copy();
+            new_data->type = read_type;
+            new_data->child_data = std::move(children);
+            return arrow::MakeArray(new_data);
+        }
+        case arrow::Type::LIST: {
+            auto read_list = std::static_pointer_cast<arrow::ListType>(read_type);
+            auto values = arrow::MakeArray(data->child_data[0]);
+            PAIMON_ASSIGN_OR_RAISE(values,
+                                   AlignArrayToReadType(values, read_list->value_type(), pool));
+            auto new_data = data->Copy();
+            new_data->type = read_type;
+            new_data->child_data = {values->data()};
+            return arrow::MakeArray(new_data);
+        }
+        case arrow::Type::MAP: {
+            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
+            const auto& entries_data = data->child_data[0];
+            auto key = arrow::MakeArray(entries_data->child_data[0]);
+            auto value = arrow::MakeArray(entries_data->child_data[1]);
+            PAIMON_ASSIGN_OR_RAISE(key, AlignArrayToReadType(key, read_map->key_type(), pool));
+            PAIMON_ASSIGN_OR_RAISE(value, AlignArrayToReadType(value, read_map->item_type(), pool));
+            auto new_entries = entries_data->Copy();
+            new_entries->type = arrow::struct_({read_map->key_field(), read_map->item_field()});
+            new_entries->child_data = {key->data(), value->data()};
+            auto new_data = data->Copy();
+            new_data->type = read_type;
+            new_data->child_data = {new_entries};
+            return arrow::MakeArray(new_data);
+        }
+        default:
+            return array;
+    }
+}
+
+}  // namespace
+
 Result<std::unique_ptr<DataEvolutionFileReader>> DataEvolutionFileReader::Create(
     std::vector<std::unique_ptr<BatchReader>>&& readers,
     const std::shared_ptr<arrow::Schema>& read_schema, int32_t read_batch_size,
@@ -82,7 +167,12 @@ Result<BatchReader::ReadBatchWithBitmap> DataEvolutionFileReader::NextBatchWithB
         }
         const auto& sub_array = array_for_each_reader[reader_offsets_[i]];
         assert(sub_array->num_fields() > field_offsets_[i]);
-        target_sub_array_vec.push_back(sub_array->field(field_offsets_[i]));
+        // Null-fill nested fields added by schema evolution (no-op otherwise).
+        PAIMON_ASSIGN_OR_RAISE(
+            std::shared_ptr<arrow::Array> aligned,
+            AlignArrayToReadType(sub_array->field(field_offsets_[i]),
+                                 read_schema_->field(i)->type(), arrow_pool_.get()));
+        target_sub_array_vec.push_back(aligned);
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
         std::shared_ptr<arrow::Array> target_array,
