@@ -150,8 +150,7 @@ Result<std::unique_ptr<FieldMappingReader>> FieldMappingReader::Create(
         if (mapping_reader->non_partition_info_.cast_executors[i] != nullptr) {
             mapping_reader->need_casting_ = true;
         }
-        // A nested type that differs by a schema-evolution added field must be
-        // reshaped (null-filled) to the read type in CastNonPartitionArrayIfNeed.
+        // A differing nested type needs the AlignArrayToReadType reshape below.
         if (!mapping_reader->non_partition_info_.non_partition_data_schema[i].Type()->Equals(
                 *mapping_reader->non_partition_info_.non_partition_read_schema[i].Type())) {
             mapping_reader->need_casting_ = true;

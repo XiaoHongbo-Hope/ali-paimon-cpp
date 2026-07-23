@@ -182,10 +182,9 @@ bool IsVariantAccessSubstitution(const std::shared_ptr<arrow::DataType>& read_ty
     return true;
 }
 
-// Reconcile a LIST/MAP item type. Read may ADD fields (schema evolution;
-// null-filled downstream) but must not DROP a file field -- format readers
-// cannot partially project inside a repeated group. Returns the file-readable
-// item type. `container` is "list" or "map" for the error message.
+// Reconcile a LIST/MAP item: read may ADD fields (evolution, null-filled
+// downstream) but must not DROP one. Returns the file-readable item type;
+// `container` names the container ("list"/"map") for the error message.
 Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
     const std::shared_ptr<arrow::DataType>& read_type,
     const std::shared_ptr<arrow::DataType>& data_type, const char* container) {
