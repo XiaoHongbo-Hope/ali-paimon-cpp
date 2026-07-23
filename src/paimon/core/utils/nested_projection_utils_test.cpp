@@ -363,6 +363,20 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeFieldIdChangeNullFillsNotLea
     ASSERT_EQ(a_out->null_count(), a_out->length());
 }
 
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeRejectsLeafTypeChange) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({1}).ok());
+    std::shared_ptr<arrow::Array> a_arr;
+    ASSERT_TRUE(ab.Finish(&a_arr).ok());
+    auto data_struct = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+    auto struct_arr = arrow::StructArray::Make({a_arr}, data_struct->fields()).ValueOrDie();
+    auto read_type = arrow::struct_({MakeField("a", arrow::int64(), 10)});
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool),
+                        "AlignArrayToReadType unsupported leaf type change");
+}
+
 TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionNoProjection) {
     auto file_schema = arrow::schema({
         MakeField("f0", arrow::int32(), 1),

@@ -588,6 +588,27 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySel
     return result_map;
 }
 
+namespace {
+// Strips physical-only differences from a leaf type: an ORC lazy-decoding
+// dictionary wrapper and the 32/64-bit offset width of string/binary. Two leaves
+// with equal normalized types hold the same logical values.
+std::shared_ptr<arrow::DataType> NormalizeLeafRepresentation(
+    const std::shared_ptr<arrow::DataType>& type) {
+    auto t = type;
+    if (t->id() == arrow::Type::DICTIONARY) {
+        t = std::static_pointer_cast<arrow::DictionaryType>(t)->value_type();
+    }
+    switch (t->id()) {
+        case arrow::Type::LARGE_STRING:
+            return arrow::utf8();
+        case arrow::Type::LARGE_BINARY:
+            return arrow::binary();
+        default:
+            return t;
+    }
+}
+}  // namespace
+
 Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadType(
     const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& read_type,
     arrow::MemoryPool* pool) {
@@ -678,10 +699,20 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
             new_data->child_data = {new_entries};
             return arrow::MakeArray(new_data);
         }
-        default:
-            // Leaf: cast to the read type (decodes an ORC dictionary, widens
-            // large_string to string, etc.).
+        default: {
+            // Leaf: only physical-representation differences are valid here (ORC
+            // dictionary encoding, string/binary offset width). Genuine type
+            // evolution is handled by FieldMappingReader's cast executors and
+            // rejected upstream in PruneDataType, so fail anything else.
+            if (!NormalizeLeafRepresentation(array->type())
+                     ->Equals(*NormalizeLeafRepresentation(read_type))) {
+                return Status::Invalid(
+                    fmt::format("AlignArrayToReadType unsupported leaf type change: data {} vs "
+                                "read {}",
+                                array->type()->ToString(), read_type->ToString()));
+            }
             return CastingUtils::Cast(array, read_type, arrow::compute::CastOptions::Safe(), pool);
+        }
     }
 }
 
