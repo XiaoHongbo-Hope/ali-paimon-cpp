@@ -595,9 +595,8 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
     if (same) {
         return array;
     }
-    // Produce exactly `read_type` so every file yields the same output type: reshape
-    // STRUCT/LIST/MAP to null-fill added fields with read-side types/nullability, and
-    // cast a leaf (which decodes an ORC dictionary and widens e.g. large_string).
+    // Produce exactly `read_type` so every file yields the same output type: rebuild
+    // STRUCT/LIST/MAP with read-side types/nullability and cast a leaf (decodes dict).
     const auto& data = array->data();
     switch (read_type->id()) {
         case arrow::Type::STRUCT: {
