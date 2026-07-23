@@ -151,12 +151,44 @@ Result<bool> NestedProjectionUtils::HasNestedSubfieldProjectionType(
 
 namespace {
 
+// Structural equality that also compares paimon field IDs on STRUCT children, so a
+// drop+add of a same-name/same-type field (new ID) is not treated as a no-op.
+Result<bool> EqualWithFieldIds(const std::shared_ptr<arrow::DataType>& a,
+                               const std::shared_ptr<arrow::DataType>& b) {
+    if (a->id() != b->id() || a->num_fields() != b->num_fields()) {
+        return false;
+    }
+    if (a->num_fields() == 0) {
+        return a->Equals(*b);
+    }
+    for (int32_t i = 0; i < a->num_fields(); ++i) {
+        const auto& fa = a->field(i);
+        const auto& fb = b->field(i);
+        if (a->id() == arrow::Type::STRUCT) {
+            if (fa->name() != fb->name()) {
+                return false;
+            }
+            // Compare IDs only when present (a map entry's key/value carry none).
+            auto id_a = NestedProjectionUtils::GetPaimonFieldId(fa);
+            auto id_b = NestedProjectionUtils::GetPaimonFieldId(fb);
+            if (id_a.ok() && id_b.ok() && id_a.value() != id_b.value()) {
+                return false;
+            }
+        }
+        PAIMON_ASSIGN_OR_RAISE(bool child_equal, EqualWithFieldIds(fa->type(), fb->type()));
+        if (!child_equal) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Whether `read_type` is `data_type` with variant columns replaced by their variant-access
-/// projections and nothing else changed. Such a read drops no field, so it is not a partial
-/// projection of an enclosing repeated group and may pass through where a real one must fail.
-bool IsVariantAccessSubstitution(const std::shared_ptr<arrow::DataType>& read_type,
-                                 const std::shared_ptr<arrow::DataType>& data_type) {
-    if (read_type->Equals(data_type)) {
+/// projections and nothing else changed (matching paimon field IDs).
+Result<bool> IsVariantAccessSubstitution(const std::shared_ptr<arrow::DataType>& read_type,
+                                         const std::shared_ptr<arrow::DataType>& data_type) {
+    PAIMON_ASSIGN_OR_RAISE(bool equal, EqualWithFieldIds(read_type, data_type));
+    if (equal) {
         return true;
     }
     if (VariantAccessUtils::IsVariantAccessType(read_type) &&
@@ -170,12 +202,21 @@ bool IsVariantAccessSubstitution(const std::shared_ptr<arrow::DataType>& read_ty
     for (int32_t i = 0; i < read_type->num_fields(); ++i) {
         const std::shared_ptr<arrow::Field>& read_child = read_type->field(i);
         const std::shared_ptr<arrow::Field>& data_child = data_type->field(i);
-        // LIST and MAP name their children by format convention, so only STRUCT is matched
-        // by name.
-        if (read_type->id() == arrow::Type::STRUCT && read_child->name() != data_child->name()) {
-            return false;
+        // LIST and MAP name their children by format convention, so only STRUCT is
+        // matched by name and field ID.
+        if (read_type->id() == arrow::Type::STRUCT) {
+            if (read_child->name() != data_child->name()) {
+                return false;
+            }
+            auto id_r = NestedProjectionUtils::GetPaimonFieldId(read_child);
+            auto id_d = NestedProjectionUtils::GetPaimonFieldId(data_child);
+            if (id_r.ok() && id_d.ok() && id_r.value() != id_d.value()) {
+                return false;
+            }
         }
-        if (!IsVariantAccessSubstitution(read_child->type(), data_child->type())) {
+        PAIMON_ASSIGN_OR_RAISE(bool sub,
+                               IsVariantAccessSubstitution(read_child->type(), data_child->type()));
+        if (!sub) {
             return false;
         }
     }
@@ -188,10 +229,12 @@ bool IsVariantAccessSubstitution(const std::shared_ptr<arrow::DataType>& read_ty
 Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
     const std::shared_ptr<arrow::DataType>& read_type,
     const std::shared_ptr<arrow::DataType>& data_type, const char* container) {
-    if (read_type->Equals(data_type)) {
+    PAIMON_ASSIGN_OR_RAISE(bool same, EqualWithFieldIds(read_type, data_type));
+    if (same) {
         return data_type;
     }
-    if (IsVariantAccessSubstitution(read_type, data_type)) {
+    PAIMON_ASSIGN_OR_RAISE(bool substitution, IsVariantAccessSubstitution(read_type, data_type));
+    if (substitution) {
         return read_type;
     }
     if (read_type->id() != data_type->id()) {
@@ -220,6 +263,12 @@ Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
                         "PruneDataType does not support partial projection inside {}: src {} vs "
                         "target {}",
                         container, data_type->ToString(), read_type->ToString()));
+                }
+                if (read_child->name() != data_child->name()) {
+                    return Status::Invalid(fmt::format(
+                        "PruneDataType does not support renaming inside {}: field id {} read '{}' "
+                        "vs data '{}'",
+                        container, data_child_id, read_child->name(), data_child->name()));
                 }
                 PAIMON_ASSIGN_OR_RAISE(
                     std::shared_ptr<arrow::DataType> item_child_type,
@@ -257,8 +306,9 @@ Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
 Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::PruneDataType(
     const std::shared_ptr<arrow::DataType>& read_type,
     const std::shared_ptr<arrow::DataType>& data_type) {
-    // Identical types need no pruning.
-    if (read_type->Equals(data_type)) {
+    // Identical types (including paimon field IDs) need no pruning.
+    PAIMON_ASSIGN_OR_RAISE(bool same, EqualWithFieldIds(read_type, data_type));
+    if (same) {
         return std::optional<std::shared_ptr<arrow::DataType>>(data_type);
     }
 
@@ -303,7 +353,9 @@ Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::P
             return std::optional<std::shared_ptr<arrow::DataType>>(arrow::struct_(pruned_fields));
         }
         case arrow::Type::LIST: {
-            if (IsVariantAccessSubstitution(read_type, data_type)) {
+            PAIMON_ASSIGN_OR_RAISE(bool list_substitution,
+                                   IsVariantAccessSubstitution(read_type, data_type));
+            if (list_substitution) {
                 return std::optional<std::shared_ptr<arrow::DataType>>(read_type);
             }
             // Added fields (schema evolution) are allowed; dropped fields still fail.
@@ -314,7 +366,9 @@ Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::P
                 arrow::list(data_type->field(0)->WithType(item)));
         }
         case arrow::Type::MAP: {
-            if (IsVariantAccessSubstitution(read_type, data_type)) {
+            PAIMON_ASSIGN_OR_RAISE(bool map_substitution,
+                                   IsVariantAccessSubstitution(read_type, data_type));
+            if (map_substitution) {
                 return std::optional<std::shared_ptr<arrow::DataType>>(read_type);
             }
             auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
@@ -530,9 +584,10 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySel
 }
 
 Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadType(
-    const std::shared_ptr<arrow::Array>& array,
-    const std::shared_ptr<arrow::DataType>& read_type, arrow::MemoryPool* pool) {
-    if (array->type()->Equals(*read_type)) {
+    const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& read_type,
+    arrow::MemoryPool* pool) {
+    PAIMON_ASSIGN_OR_RAISE(bool same, EqualWithFieldIds(array->type(), read_type));
+    if (same) {
         return array;
     }
     // Leaves keep their encoding (e.g. ORC dictionary); only STRUCT/LIST/MAP are

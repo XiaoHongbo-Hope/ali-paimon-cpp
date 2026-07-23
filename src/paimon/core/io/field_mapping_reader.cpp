@@ -219,10 +219,10 @@ Result<std::shared_ptr<arrow::Array>> FieldMappingReader::CastNonPartitionArrayI
                                        arrow::compute::CastOptions::Safe(), arrow_pool_.get()));
             }
             PAIMON_ASSIGN_OR_RAISE(
-                column, non_partition_info_.cast_executors[i]->Cast(
-                            single_column_array,
-                            non_partition_info_.non_partition_read_schema[i].Type(),
-                            arrow_pool_.get()));
+                column,
+                non_partition_info_.cast_executors[i]->Cast(
+                    single_column_array, non_partition_info_.non_partition_read_schema[i].Type(),
+                    arrow_pool_.get()));
         } else {
             // read and data type may both be string type, but after adapter transform, type may be
             // dictionary, need reconstruct struct type

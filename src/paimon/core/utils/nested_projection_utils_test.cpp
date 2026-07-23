@@ -224,14 +224,12 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeListDroppingSiblingOfVariantStillFa
 }
 
 TEST(NestedProjectionUtilsTest, PruneDataTypeListStructSchemaEvolutionAddedField) {
-    // Schema evolution: a field (id=12) was added inside the list's struct, so
-    // read is a superset of the file (nothing dropped). Should read the file's
-    // struct and return it; the added field is null-filled downstream.
+    // Added field (id=12) inside the list's struct: return the file struct.
     auto data_inner =
         arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
-    auto read_inner = arrow::struct_({MakeField("a", arrow::int32(), 10),
-                                      MakeField("b", arrow::utf8(), 11),
-                                      MakeField("c", arrow::int32(), 12)});
+    auto read_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11),
+                        MakeField("c", arrow::int32(), 12)});
     auto data_type = arrow::list(arrow::field("item", data_inner));
     auto read_type = arrow::list(arrow::field("item", read_inner));
 
@@ -244,9 +242,9 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeMapStructSchemaEvolutionAddedField)
     // Added field inside a MAP value.
     auto data_inner =
         arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
-    auto read_inner = arrow::struct_({MakeField("a", arrow::int32(), 10),
-                                      MakeField("b", arrow::utf8(), 11),
-                                      MakeField("c", arrow::int32(), 12)});
+    auto read_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11),
+                        MakeField("c", arrow::int32(), 12)});
     auto data_type = arrow::map(arrow::utf8(), data_inner);
     auto read_type = arrow::map(arrow::utf8(), read_inner);
 
@@ -259,8 +257,8 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeListStructDropAndAddStillFails) {
     // Dropping a file field (b) is a real partial projection -- keep failing.
     auto data_inner =
         arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
-    auto read_inner = arrow::struct_(
-        {MakeField("a", arrow::int32(), 10), MakeField("c", arrow::int32(), 12)});
+    auto read_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("c", arrow::int32(), 12)});
     auto data_type = arrow::list(arrow::field("item", data_inner));
     auto read_type = arrow::list(arrow::field("item", read_inner));
 
@@ -291,9 +289,9 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeNullFillsAddedListStructFiel
         arrow::ListArray::FromArrays(*offsets, *struct_arr, pool).ValueOrDie();
 
     // read type adds c:int(12) inside the struct.
-    auto read_struct = arrow::struct_({MakeField("a", arrow::int32(), 10),
-                                       MakeField("b", arrow::utf8(), 11),
-                                       MakeField("c", arrow::int32(), 12)});
+    auto read_struct =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11),
+                        MakeField("c", arrow::int32(), 12)});
     auto read_type = arrow::list(arrow::field("item", read_struct));
 
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
@@ -310,8 +308,7 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeNullFillsAddedListStructFiel
 }
 
 TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsDictionaryLeafAndNullFills) {
-    // ORC lazy decoding returns nested strings as dictionary; a dict-encoded `a`
-    // must be kept (not rejected) while the added `b` is null-filled.
+    // ORC lazy decoding returns nested strings as dictionary: keep it, null-fill b.
     auto* pool = arrow::default_memory_pool();
     arrow::StringBuilder vb(pool);
     ASSERT_TRUE(vb.AppendValues({"x", "y"}).ok());
@@ -337,6 +334,24 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsDictionaryLeafAndNullFi
     auto b = out->GetFieldByName("b");
     ASSERT_NE(b, nullptr);
     ASSERT_EQ(b->null_count(), b->length());  // added `b` all null
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeFieldIdChangeNullFillsNotLeak) {
+    // a(id=10) replaced by a(id=11), same name/type: new field must read null, not leak.
+    auto* pool = arrow::default_memory_pool();
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({42}).ok());
+    std::shared_ptr<arrow::Array> a_arr;
+    ASSERT_TRUE(ab.Finish(&a_arr).ok());
+    auto data_struct = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+    auto struct_arr = arrow::StructArray::Make({a_arr}, data_struct->fields()).ValueOrDie();
+    auto read_type = arrow::struct_({MakeField("a", arrow::int32(), 11)});
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    auto a_out = std::static_pointer_cast<arrow::StructArray>(aligned)->GetFieldByName("a");
+    ASSERT_NE(a_out, nullptr);
+    ASSERT_EQ(a_out->null_count(), a_out->length());
 }
 
 TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionNoProjection) {
