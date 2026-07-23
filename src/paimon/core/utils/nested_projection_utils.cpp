@@ -26,6 +26,7 @@
 #include "arrow/array/array_primitive.h"
 #include "arrow/array/builder_primitive.h"
 #include "arrow/array/concatenate.h"
+#include "arrow/array/util.h"
 #include "arrow/type.h"
 #include "fmt/format.h"
 #include "paimon/common/data/variant/variant_access_utils.h"
@@ -523,6 +524,76 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySel
     std::shared_ptr<arrow::Array> result_map;
     PAIMON_RETURN_NOT_OK_FROM_ARROW(map_builder.Finish(&result_map));
     return result_map;
+}
+
+Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadType(
+    const std::shared_ptr<arrow::Array>& array,
+    const std::shared_ptr<arrow::DataType>& read_type, arrow::MemoryPool* pool) {
+    if (array->type()->Equals(*read_type)) {
+        return array;
+    }
+    const auto& data = array->data();
+    switch (read_type->id()) {
+        case arrow::Type::STRUCT: {
+            const auto& array_type = array->type();
+            std::vector<std::shared_ptr<arrow::ArrayData>> children;
+            children.reserve(read_type->num_fields());
+            for (const auto& read_field : read_type->fields()) {
+                PAIMON_ASSIGN_OR_RAISE(int32_t read_id, GetPaimonFieldId(read_field));
+                int32_t match = -1;
+                for (int32_t j = 0; j < array_type->num_fields(); j++) {
+                    PAIMON_ASSIGN_OR_RAISE(int32_t data_id, GetPaimonFieldId(array_type->field(j)));
+                    if (data_id == read_id) {
+                        match = j;
+                        break;
+                    }
+                }
+                if (match >= 0) {
+                    auto child = arrow::MakeArray(data->child_data[match]);
+                    PAIMON_ASSIGN_OR_RAISE(child,
+                                           AlignArrayToReadType(child, read_field->type(), pool));
+                    children.push_back(child->data());
+                } else {
+                    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                        std::shared_ptr<arrow::Array> null_child,
+                        arrow::MakeArrayOfNull(read_field->type(), data->offset + data->length,
+                                               pool));
+                    children.push_back(null_child->data());
+                }
+            }
+            auto new_data = data->Copy();
+            new_data->type = read_type;
+            new_data->child_data = std::move(children);
+            return arrow::MakeArray(new_data);
+        }
+        case arrow::Type::LIST: {
+            auto read_list = std::static_pointer_cast<arrow::ListType>(read_type);
+            auto values = arrow::MakeArray(data->child_data[0]);
+            PAIMON_ASSIGN_OR_RAISE(values,
+                                   AlignArrayToReadType(values, read_list->value_type(), pool));
+            auto new_data = data->Copy();
+            new_data->type = read_type;
+            new_data->child_data = {values->data()};
+            return arrow::MakeArray(new_data);
+        }
+        case arrow::Type::MAP: {
+            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
+            const auto& entries_data = data->child_data[0];
+            auto key = arrow::MakeArray(entries_data->child_data[0]);
+            auto value = arrow::MakeArray(entries_data->child_data[1]);
+            PAIMON_ASSIGN_OR_RAISE(key, AlignArrayToReadType(key, read_map->key_type(), pool));
+            PAIMON_ASSIGN_OR_RAISE(value, AlignArrayToReadType(value, read_map->item_type(), pool));
+            auto new_entries = entries_data->Copy();
+            new_entries->type = arrow::struct_({read_map->key_field(), read_map->item_field()});
+            new_entries->child_data = {key->data(), value->data()};
+            auto new_data = data->Copy();
+            new_data->type = read_type;
+            new_data->child_data = {new_entries};
+            return arrow::MakeArray(new_data);
+        }
+        default:
+            return array;
+    }
 }
 
 }  // namespace paimon

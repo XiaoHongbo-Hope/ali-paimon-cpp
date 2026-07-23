@@ -35,6 +35,7 @@
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/core/casting/cast_executor.h"
 #include "paimon/core/casting/casting_utils.h"
+#include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/core/utils/field_mapping.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/memory/bytes.h"
@@ -149,6 +150,12 @@ Result<std::unique_ptr<FieldMappingReader>> FieldMappingReader::Create(
         if (mapping_reader->non_partition_info_.cast_executors[i] != nullptr) {
             mapping_reader->need_casting_ = true;
         }
+        // A nested type that differs by a schema-evolution added field must be
+        // reshaped (null-filled) to the read type in CastNonPartitionArrayIfNeed.
+        if (!mapping_reader->non_partition_info_.non_partition_data_schema[i].Type()->Equals(
+                *mapping_reader->non_partition_info_.non_partition_read_schema[i].Type())) {
+            mapping_reader->need_casting_ = true;
+        }
         // Field name change (RENAME COLUMN) also requires mapping: data schema
         // carries the file's physical name while read schema carries the
         // post-rename logical name. If we skipped mapping, the inner reader's
@@ -201,6 +208,7 @@ Result<std::shared_ptr<arrow::Array>> FieldMappingReader::CastNonPartitionArrayI
     casted_array.reserve(field_count);
     casted_field_names.reserve(field_count);
     for (int32_t i = 0; i < field_count; i++) {
+        std::shared_ptr<arrow::Array> column;
         if (non_partition_info_.cast_executors[i] != nullptr) {
             auto single_column_array = struct_array->field(i);
             // if src array is dict, cast to string first
@@ -213,18 +221,22 @@ Result<std::shared_ptr<arrow::Array>> FieldMappingReader::CastNonPartitionArrayI
                                        arrow::compute::CastOptions::Safe(), arrow_pool_.get()));
             }
             PAIMON_ASSIGN_OR_RAISE(
-                std::shared_ptr<arrow::Array> casted,
-                non_partition_info_.cast_executors[i]->Cast(
-                    single_column_array, non_partition_info_.non_partition_read_schema[i].Type(),
-                    arrow_pool_.get()));
-            casted_array.push_back(casted);
-            casted_field_names.push_back(non_partition_info_.non_partition_data_schema[i].Name());
+                column, non_partition_info_.cast_executors[i]->Cast(
+                            single_column_array,
+                            non_partition_info_.non_partition_read_schema[i].Type(),
+                            arrow_pool_.get()));
         } else {
             // read and data type may both be string type, but after adapter transform, type may be
             // dictionary, need reconstruct struct type
-            casted_array.push_back(struct_array->field(i));
-            casted_field_names.push_back(non_partition_info_.non_partition_data_schema[i].Name());
+            column = struct_array->field(i);
         }
+        // Null-fill nested fields added by schema evolution (no-op otherwise).
+        PAIMON_ASSIGN_OR_RAISE(
+            column, NestedProjectionUtils::AlignArrayToReadType(
+                        column, non_partition_info_.non_partition_read_schema[i].Type(),
+                        arrow_pool_.get()));
+        casted_array.push_back(column);
+        casted_field_names.push_back(non_partition_info_.non_partition_data_schema[i].Name());
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> arrow_array,
                                       arrow::StructArray::Make(casted_array, casted_field_names));
