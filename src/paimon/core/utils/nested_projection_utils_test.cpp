@@ -267,6 +267,47 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeListStructDropAndAddStillFails) {
                         "partial projection inside list");
 }
 
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeNullFillsAddedListStructField) {
+    auto* pool = arrow::default_memory_pool();
+    // file array: list<struct<a:int(10), b:string(11)>> = [ [{1,"x"},{2,"y"}], [{3,"z"}] ]
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({1, 2, 3}).ok());
+    std::shared_ptr<arrow::Array> a;
+    ASSERT_TRUE(ab.Finish(&a).ok());
+    arrow::StringBuilder bb(pool);
+    ASSERT_TRUE(bb.AppendValues({"x", "y", "z"}).ok());
+    std::shared_ptr<arrow::Array> b;
+    ASSERT_TRUE(bb.Finish(&b).ok());
+    auto data_struct_type =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    std::shared_ptr<arrow::Array> struct_arr =
+        arrow::StructArray::Make({a, b}, data_struct_type->fields()).ValueOrDie();
+    arrow::Int32Builder offb(pool);
+    ASSERT_TRUE(offb.AppendValues({0, 2, 3}).ok());
+    std::shared_ptr<arrow::Array> offsets;
+    ASSERT_TRUE(offb.Finish(&offsets).ok());
+    std::shared_ptr<arrow::Array> list_arr =
+        arrow::ListArray::FromArrays(*offsets, *struct_arr, pool).ValueOrDie();
+
+    // read type adds c:int(12) inside the struct.
+    auto read_struct = arrow::struct_({MakeField("a", arrow::int32(), 10),
+                                       MakeField("b", arrow::utf8(), 11),
+                                       MakeField("c", arrow::int32(), 12)});
+    auto read_type = arrow::list(arrow::field("item", read_struct));
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(list_arr, read_type, pool));
+    ASSERT_TRUE(aligned->type()->Equals(*read_type)) << aligned->type()->ToString();
+    auto out_struct = std::static_pointer_cast<arrow::StructArray>(
+        std::static_pointer_cast<arrow::ListArray>(aligned)->values());
+    auto c_col = out_struct->GetFieldByName("c");
+    ASSERT_NE(c_col, nullptr);
+    ASSERT_EQ(c_col->null_count(), c_col->length());  // added field is all null
+    auto a_col = std::static_pointer_cast<arrow::Int32Array>(out_struct->GetFieldByName("a"));
+    ASSERT_EQ(a_col->Value(0), 1);
+    ASSERT_EQ(a_col->Value(2), 3);
+}
+
 TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionNoProjection) {
     auto file_schema = arrow::schema({
         MakeField("f0", arrow::int32(), 1),
