@@ -22,6 +22,7 @@
 #include "arrow/array/builder_dict.h"
 #include "arrow/array/builder_nested.h"
 #include "arrow/array/builder_primitive.h"
+#include "arrow/ipc/json_simple.h"
 #include "arrow/memory_pool.h"
 #include "arrow/type.h"
 #include "gtest/gtest.h"
@@ -310,17 +311,9 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeNullFillsAddedListStructFiel
 TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsDictionaryLeafAndNullFills) {
     // ORC lazy decoding returns nested strings as dictionary: keep it, null-fill b.
     auto* pool = arrow::default_memory_pool();
-    arrow::StringBuilder vb(pool);
-    ASSERT_TRUE(vb.AppendValues({"x", "y"}).ok());
-    std::shared_ptr<arrow::Array> dict_values;
-    ASSERT_TRUE(vb.Finish(&dict_values).ok());
-    arrow::Int32Builder ib(pool);
-    ASSERT_TRUE(ib.AppendValues({0, 1, 0}).ok());
-    std::shared_ptr<arrow::Array> dict_indices;
-    ASSERT_TRUE(ib.Finish(&dict_indices).ok());
     auto dict_type = arrow::dictionary(arrow::int32(), arrow::utf8());
     auto a_dict =
-        arrow::DictionaryArray::FromArrays(dict_type, dict_indices, dict_values).ValueOrDie();
+        arrow::ipc::internal::json::ArrayFromJSON(dict_type, R"(["x", "y", "x"])").ValueOrDie();
     auto data_struct = arrow::struct_({MakeField("a", dict_type, 10)});
     auto struct_arr = arrow::StructArray::Make({a_dict}, data_struct->fields()).ValueOrDie();
 

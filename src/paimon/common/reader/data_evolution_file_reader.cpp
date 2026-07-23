@@ -25,7 +25,6 @@
 #include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
-#include "paimon/core/utils/nested_projection_utils.h"
 
 namespace paimon {
 
@@ -86,12 +85,8 @@ Result<BatchReader::ReadBatchWithBitmap> DataEvolutionFileReader::NextBatchWithB
         }
         const auto& sub_array = array_for_each_reader[reader_offsets_[i]];
         assert(sub_array->num_fields() > field_offsets_[i]);
-        // Null-fill nested fields added by schema evolution (no-op otherwise).
-        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> aligned,
-                               NestedProjectionUtils::AlignArrayToReadType(
-                                   sub_array->field(field_offsets_[i]),
-                                   read_schema_->field(i)->type(), arrow_pool_.get()));
-        target_sub_array_vec.push_back(aligned);
+        // Each file is already aligned to its read schema by its FieldMappingReader.
+        target_sub_array_vec.push_back(sub_array->field(field_offsets_[i]));
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
         std::shared_ptr<arrow::Array> target_array,
