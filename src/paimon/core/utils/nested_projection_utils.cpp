@@ -27,11 +27,13 @@
 #include "arrow/array/builder_primitive.h"
 #include "arrow/array/concatenate.h"
 #include "arrow/array/util.h"
+#include "arrow/compute/cast.h"
 #include "arrow/type.h"
 #include "fmt/format.h"
 #include "paimon/common/data/variant/variant_access_utils.h"
 #include "paimon/common/data/variant/variant_type_utils.h"
 #include "paimon/common/utils/string_utils.h"
+#include "paimon/core/casting/casting_utils.h"
 #include "paimon/status.h"
 
 namespace paimon {
@@ -164,6 +166,9 @@ Result<bool> EqualWithFieldIds(const std::shared_ptr<arrow::DataType>& a,
     for (int32_t i = 0; i < a->num_fields(); ++i) {
         const auto& fa = a->field(i);
         const auto& fb = b->field(i);
+        if (fa->nullable() != fb->nullable()) {
+            return false;
+        }
         if (a->id() == arrow::Type::STRUCT) {
             if (fa->name() != fb->name()) {
                 return false;
@@ -590,8 +595,9 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
     if (same) {
         return array;
     }
-    // Leaves keep their encoding (e.g. ORC dictionary); only STRUCT/LIST/MAP are
-    // reshaped to null-fill added fields, with the output type built from actual children.
+    // Produce exactly `read_type` so every file yields the same output type: reshape
+    // STRUCT/LIST/MAP to null-fill added fields with read-side types/nullability, and
+    // cast a leaf (which decodes an ORC dictionary and widens e.g. large_string).
     const auto& data = array->data();
     switch (read_type->id()) {
         case arrow::Type::STRUCT: {
@@ -601,9 +607,7 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
                                                    read_type->ToString()));
             }
             const auto& array_type = array->type();
-            arrow::FieldVector out_fields;
             std::vector<std::shared_ptr<arrow::ArrayData>> children;
-            out_fields.reserve(read_type->num_fields());
             children.reserve(read_type->num_fields());
             for (const auto& read_field : read_type->fields()) {
                 // Match by name (parquet drops nested field-id metadata); if both
@@ -627,18 +631,16 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
                     PAIMON_ASSIGN_OR_RAISE(child,
                                            AlignArrayToReadType(child, read_field->type(), pool));
                     children.push_back(child->data());
-                    out_fields.push_back(read_field->WithType(child->type()));
                 } else {
                     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
                         std::shared_ptr<arrow::Array> null_child,
                         arrow::MakeArrayOfNull(read_field->type(), data->offset + data->length,
                                                pool));
                     children.push_back(null_child->data());
-                    out_fields.push_back(read_field);
                 }
             }
             auto new_data = data->Copy();
-            new_data->type = arrow::struct_(out_fields);
+            new_data->type = read_type;
             new_data->child_data = std::move(children);
             return arrow::MakeArray(new_data);
         }
@@ -649,12 +651,11 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
                                                    read_type->ToString()));
             }
             auto read_list = std::static_pointer_cast<arrow::ListType>(read_type);
-            auto data_list = std::static_pointer_cast<arrow::ListType>(array->type());
             auto values = arrow::MakeArray(data->child_data[0]);
             PAIMON_ASSIGN_OR_RAISE(values,
                                    AlignArrayToReadType(values, read_list->value_type(), pool));
             auto new_data = data->Copy();
-            new_data->type = arrow::list(data_list->value_field()->WithType(values->type()));
+            new_data->type = read_type;
             new_data->child_data = {values->data()};
             return arrow::MakeArray(new_data);
         }
@@ -665,34 +666,23 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
                                                    read_type->ToString()));
             }
             auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
-            auto data_map = std::static_pointer_cast<arrow::MapType>(array->type());
             const auto& entries_data = data->child_data[0];
             auto key = arrow::MakeArray(entries_data->child_data[0]);
             auto value = arrow::MakeArray(entries_data->child_data[1]);
             PAIMON_ASSIGN_OR_RAISE(key, AlignArrayToReadType(key, read_map->key_type(), pool));
             PAIMON_ASSIGN_OR_RAISE(value, AlignArrayToReadType(value, read_map->item_type(), pool));
-            auto key_field = data_map->key_field()->WithType(key->type());
-            auto item_field = data_map->item_field()->WithType(value->type());
             auto new_entries = entries_data->Copy();
-            new_entries->type = arrow::struct_({key_field, item_field});
+            new_entries->type = arrow::struct_({read_map->key_field(), read_map->item_field()});
             new_entries->child_data = {key->data(), value->data()};
             auto new_data = data->Copy();
-            new_data->type =
-                std::make_shared<arrow::MapType>(key_field, item_field, data_map->keys_sorted());
+            new_data->type = read_type;
             new_data->child_data = {new_entries};
             return arrow::MakeArray(new_data);
         }
         default:
-            // A dictionary of the read value type (ORC lazy decoding) is kept;
-            // any other leaf mismatch is unsupported nested type evolution.
-            if (array->type()->id() == arrow::Type::DICTIONARY &&
-                std::static_pointer_cast<arrow::DictionaryType>(array->type())
-                    ->value_type()
-                    ->Equals(*read_type)) {
-                return array;
-            }
-            return Status::Invalid(fmt::format("AlignArrayToReadType cannot reconcile {} to {}",
-                                               array->type()->ToString(), read_type->ToString()));
+            // Leaf: cast to the read type (decodes an ORC dictionary, widens
+            // large_string to string, etc.).
+            return CastingUtils::Cast(array, read_type, arrow::compute::CastOptions::Safe(), pool);
     }
 }
 

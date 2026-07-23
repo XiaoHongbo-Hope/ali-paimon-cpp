@@ -308,10 +308,10 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeNullFillsAddedListStructFiel
     ASSERT_EQ(a_col->Value(2), 3);
 }
 
-TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsDictionaryLeafAndNullFills) {
-    // ORC lazy decoding returns nested strings as dictionary: keep it, null-fill b.
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeDecodesDictionaryLeafAndNullFills) {
+    // ORC lazy decoding returns dictionary<int64, large_string>; decode/cast to string.
     auto* pool = arrow::default_memory_pool();
-    auto dict_type = arrow::dictionary(arrow::int32(), arrow::utf8());
+    auto dict_type = arrow::dictionary(arrow::int64(), arrow::large_utf8());
     auto a_dict =
         arrow::ipc::internal::json::ArrayFromJSON(dict_type, R"(["x", "y", "x"])").ValueOrDie();
     auto data_struct = arrow::struct_({MakeField("a", dict_type, 10)});
@@ -321,12 +321,28 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsDictionaryLeafAndNullFi
         arrow::struct_({MakeField("a", arrow::utf8(), 10), MakeField("b", arrow::int32(), 11)});
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
                          NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    ASSERT_TRUE(aligned->type()->Equals(*read_type)) << aligned->type()->ToString();
     auto out = std::static_pointer_cast<arrow::StructArray>(aligned);
-    ASSERT_EQ(out->num_fields(), 2);
-    ASSERT_EQ(out->field(0)->type_id(), arrow::Type::DICTIONARY);  // `a` kept dict-encoded
+    ASSERT_EQ(std::static_pointer_cast<arrow::StringArray>(out->GetFieldByName("a"))->GetString(0),
+              "x");
     auto b = out->GetFieldByName("b");
-    ASSERT_NE(b, nullptr);
-    ASSERT_EQ(b->null_count(), b->length());  // added `b` all null
+    ASSERT_EQ(b->null_count(), b->length());
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeAppliesReadNullability) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({1, 2}).ok());
+    std::shared_ptr<arrow::Array> a_arr;
+    ASSERT_TRUE(ab.Finish(&a_arr).ok());
+    auto data_field = DataField::ConvertDataFieldToArrowField(
+        DataField(10, arrow::field("a", arrow::int32(), /*nullable=*/false)));
+    auto struct_arr = arrow::StructArray::Make({a_arr}, {data_field}).ValueOrDie();
+    auto read_type = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    ASSERT_TRUE(aligned->type()->field(0)->nullable());
 }
 
 TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeFieldIdChangeNullFillsNotLeak) {

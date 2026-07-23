@@ -436,9 +436,13 @@ TEST_P(WriteAndReadInteTest, TestSchemaEvolutionAddFieldInsideListAndMap) {
         arrow::field("props", arrow::map(arrow::utf8(), map_value)),
     };
     std::map<std::string, std::string> options = {
-        {Options::MANIFEST_FORMAT, "avro"},  {Options::FILE_FORMAT, file_format},
-        {Options::TARGET_FILE_SIZE, "1024"}, {Options::BUCKET, "-1"},
+        {Options::MANIFEST_FORMAT, "avro"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::TARGET_FILE_SIZE, "1024"},
+        {Options::BUCKET, "-1"},
         {Options::FILE_SYSTEM, file_system},
+        // Exercise ORC lazy decoding, which returns nested strings as dictionaries.
+        {"orc.read.enable-lazy-decoding", "true"},
     };
     if (file_system == "jindo") {
         options = AddOptionsForJindo(options);
