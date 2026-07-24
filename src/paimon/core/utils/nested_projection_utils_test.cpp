@@ -377,6 +377,24 @@ TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeRejectsLeafTypeChange) {
                         "AlignArrayToReadType unsupported leaf type change");
 }
 
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsNestedLargeBinaryBlob) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::LargeBinaryBuilder blobb(pool);
+    ASSERT_TRUE(blobb.AppendValues({"a", "b"}).ok());
+    std::shared_ptr<arrow::Array> blob;
+    ASSERT_TRUE(blobb.Finish(&blob).ok());
+    auto data_struct = arrow::struct_({MakeField("blob", arrow::large_binary(), 10)});
+    auto struct_arr = arrow::StructArray::Make({blob}, data_struct->fields()).ValueOrDie();
+    auto read_type = arrow::struct_(
+        {MakeField("blob", arrow::large_binary(), 10), MakeField("c", arrow::int32(), 11)});
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    auto blob_out = std::static_pointer_cast<arrow::StructArray>(aligned)->GetFieldByName("blob");
+    ASSERT_EQ(blob_out->type_id(), arrow::Type::LARGE_BINARY);
+    ASSERT_TRUE(blob_out->Equals(*blob));
+}
+
 TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionNoProjection) {
     auto file_schema = arrow::schema({
         MakeField("f0", arrow::int32(), 1),
