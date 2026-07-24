@@ -589,23 +589,21 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySel
 }
 
 namespace {
-// Strips physical-only differences from a leaf type: an ORC lazy-decoding
-// dictionary wrapper and the 32/64-bit offset width of string/binary. Two leaves
-// with equal normalized types hold the same logical values.
+// Strips physical-only differences from a leaf type: ORC lazy decoding wraps
+// strings in a dictionary and may widen them to large_string. binary is not
+// dictionary-encoded and large_binary is blob's real type, so neither is
+// normalized. Two leaves with equal normalized types hold the same logical
+// values.
 std::shared_ptr<arrow::DataType> NormalizeLeafRepresentation(
     const std::shared_ptr<arrow::DataType>& type) {
     auto t = type;
     if (t->id() == arrow::Type::DICTIONARY) {
         t = std::static_pointer_cast<arrow::DictionaryType>(t)->value_type();
     }
-    switch (t->id()) {
-        case arrow::Type::LARGE_STRING:
-            return arrow::utf8();
-        case arrow::Type::LARGE_BINARY:
-            return arrow::binary();
-        default:
-            return t;
+    if (t->id() == arrow::Type::LARGE_STRING) {
+        return arrow::utf8();
     }
+    return t;
 }
 }  // namespace
 
